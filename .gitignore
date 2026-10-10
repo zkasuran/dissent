@@ -11,3 +11,4 @@ broadcast/
 # artefactos de python del puente
 __pycache__/
 *.pyc
+.live-demo-journal.tsv
