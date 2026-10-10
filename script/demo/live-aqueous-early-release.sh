@@ -78,16 +78,22 @@ note "  chain 143, not a fork, head $(cast block-number --rpc-url "$RPC")"
 [[ -z "${DEMO_REHEARSAL:-}" ]] || die "DEMO_REHEARSAL is set, which is a fork-only override"
 
 # The policy has to still be live. Committing against a revoked policy spends the bounty for nothing.
-POLICY_CODE_OWNER=$(cast call "$POLICY_REGISTRY" 'policyRecomputer(bytes32)(address)' "$POLICY_ID" --rpc-url "$RPC" 2>/dev/null || echo "")
-if [[ -n "$POLICY_CODE_OWNER" ]]; then
-  [[ "${POLICY_CODE_OWNER,,}" == "${RECOMPUTER,,}" ]] \
-    || die "policy $POLICY_ID maps to $POLICY_CODE_OWNER, not the reviewed recomputer $RECOMPUTER"
-  note "  policy registered against the reviewed recomputer"
-else
-  # The getter name is not part of what we reviewed, so a failed read is reported rather than
-  # treated as absence. Absence of evidence is not evidence of absence.
-  note "  NOTE: could not read the policy through policyRecomputer(bytes32). Confirm by hand before step 4."
-fi
+# Read through the reviewed registry's own getter, getPolicy(bytes32), and stop if the read fails:
+# an unreadable policy is not evidence of a live one. _requirePolicy in the Solidity re-checks the
+# same three fields at simulation time, so this is the earlier of two gates, not the only one.
+POLICY_JSON=$(cast call "$POLICY_REGISTRY" 'getPolicy(bytes32)((address,bytes32,uint128,uint32,uint32,uint32,bool))' \
+  "$POLICY_ID" --rpc-url "$RPC" --json 2>/dev/null) || die "could not read getPolicy($POLICY_ID) from $POLICY_REGISTRY"
+P_RECOMPUTER=$(jq -r '.[0][0] // .[0]' <<<"$POLICY_JSON" 2>/dev/null | tr 'A-F' 'a-f')
+P_CODEHASH=$(jq -r '.[0][1] // .[1]' <<<"$POLICY_JSON" 2>/dev/null | tr 'A-F' 'a-f')
+P_ACTIVE=$(jq -r '.[0][6] // .[6]' <<<"$POLICY_JSON" 2>/dev/null)
+[[ "$P_ACTIVE" == true ]] || die "policy $POLICY_ID is not active (read: $POLICY_JSON)"
+[[ "$P_RECOMPUTER" == "$(tr 'A-F' 'a-f' <<<"$RECOMPUTER")" ]] \
+  || die "policy $POLICY_ID points at recomputer $P_RECOMPUTER, not the reviewed $RECOMPUTER"
+LIVE_CODEHASH=$(cast keccak "$(cast code "$RECOMPUTER" --rpc-url "$RPC")" | tr 'A-F' 'a-f') \
+  || die "could not read the recomputer's code to compare its hash"
+[[ "$P_CODEHASH" == "$LIVE_CODEHASH" ]] \
+  || die "policy codeHash $P_CODEHASH does not match the recomputer's live code hash $LIVE_CODEHASH"
+note "  policy active, recomputer and codeHash match the reviewed ones (getPolicy)"
 
 set -a; . "$WORKSPACE/.env"; set +a
 AGENT=$(cast wallet address --private-key "$HOUSE_WALLET_PRIVATE_KEY")
@@ -122,13 +128,30 @@ forge_step() { # name, contract, private-key-var
   code=$?
   set -e
   printf '%s\n' "$out" | grep -vi 'private key\|secret' | tail -14
-  [[ $code -eq 0 ]] || { note "step failed: forge exited $code"; exit 1; }
-  [[ -s "$RUN_FILE" ]] || { note "step failed: forge wrote no run file"; exit 1; }
-  [[ "$(jq '.receipts | length' "$RUN_FILE")" == 1 ]] || { note "step failed: expected exactly one transaction"; exit 1; }
-  LAST_HASH=$(jq -r '.receipts[0].transactionHash' "$RUN_FILE")
-  record "$name" "$LAST_HASH"                       # on disk BEFORE any receipt read
-  local st; st=$(cast receipt "$LAST_HASH" status --rpc-url "$RPC")
-  [[ "$st" == true || "$st" == 1* ]] || { note "step failed: $LAST_HASH reverted"; exit 1; }
+
+  # Journal every hash we can find BEFORE deciding whether the step passed. A forge that broadcast and
+  # then died, or a receipt that never came back, is still money that may have moved. Sources, in
+  # order: the run file's transactions and receipts, then any 32-byte hash forge printed as a tx hash.
+  local hashes=""
+  if [[ -s "$RUN_FILE" ]]; then
+    hashes=$(jq -r '[(.transactions // [])[].hash, (.receipts // [])[].transactionHash] | map(select(. != null)) | .[]' "$RUN_FILE" 2>/dev/null || true)
+  fi
+  hashes+=$'\n'$(printf '%s\n' "$out" | grep -iE '(hash|transaction)' | grep -oE '0x[0-9a-fA-F]{64}' || true)
+  hashes=$(printf '%s\n' "$hashes" | grep -E '^0x[0-9a-fA-F]{64}$' | tr 'A-F' 'a-f' | awk '!seen[$0]++' || true)
+  local h
+  for h in $hashes; do record "$name (broadcast, forge exit $code)" "$h"; done
+  if [[ -s "$RUN_FILE" ]]; then cp "$RUN_FILE" "$JOURNAL.$(date -u +%Y%m%dT%H%M%SZ).$contract.json"; fi
+
+  # From here every failure stops WITHOUT resending. Reconcile by hand from the journal first.
+  stop() { note "step failed: $1"; note "  journal: $JOURNAL. Reconcile these hashes before any retry. Nothing was resent."; exit 1; }
+  [[ $code -eq 0 ]] || stop "forge exited $code"
+  [[ -s "$RUN_FILE" ]] || stop "forge wrote no run file"
+  [[ "$(jq '.receipts | length' "$RUN_FILE")" == 1 ]] || stop "expected exactly one transaction"
+  LAST_HASH=$(jq -r '.receipts[0].transactionHash' "$RUN_FILE" | tr 'A-F' 'a-f')
+  local st
+  st=$(cast receipt "$LAST_HASH" status --rpc-url "$RPC" 2>/dev/null) || { record "$name receipt read failed" "$LAST_HASH"; stop "could not read the receipt for $LAST_HASH"; }
+  [[ "$st" == true || "$st" == 1* ]] || { record "$name reverted" "$LAST_HASH"; stop "$LAST_HASH reverted"; }
+  record "$name confirmed" "$LAST_HASH"
   note "  $LAST_HASH ok"
 }
 
@@ -142,10 +165,12 @@ if has 0; then
   if [[ "$LIVE" != 1 ]]; then
     note "  dry run, would send $BUYER_GAS_TOPUP from $AGENT to $BUYER"
   else
+    # --async returns the hash as soon as the node accepts it, so it is journaled before the wait.
     h=$(cast send "$BUYER" --value "$BUYER_GAS_TOPUP" --private-key "$HOUSE_WALLET_PRIVATE_KEY" \
-        --rpc-url "$RPC" --json | jq -r .transactionHash)
-    record "0 agent tops up buyer gas" "$h"
-    [[ "$(cast receipt "$h" status --rpc-url "$RPC")" == true ]] || { note "top-up failed"; exit 1; }
+        --rpc-url "$RPC" --async) || { note "top-up send failed, check the agent's nonce before any retry"; exit 1; }
+    record "0 agent tops up buyer gas (broadcast)" "$h"
+    st=$(cast receipt "$h" status --rpc-url "$RPC" 2>/dev/null) || { record "0 receipt read failed" "$h"; note "could not read the top-up receipt for $h. Nothing was resent."; exit 1; }
+    [[ "$st" == true || "$st" == 1* ]] || { note "top-up $h reverted"; exit 1; }
     note "  $h ok, buyer now $(cast balance "$BUYER" --rpc-url "$RPC" --ether) MON"
   fi
 fi
@@ -162,11 +187,29 @@ if has 4; then
         '[.logs[] | select((.address|ascii_downcase)==$core)][-1].topics[1]')
     [[ "$COMMITMENT_ID" =~ ^0x[0-9a-f]{64}$ ]] || { note "no Committed event in the commit receipt"; exit 1; }
     record "commitment id" "$COMMITMENT_ID"
-    note "  commitment id from the Committed event: $COMMITMENT_ID"
+    # _commitment() in the Solidity reads DEMO_COMMITMENT_ID, so that is the name the release step needs.
+    export DEMO_COMMITMENT_ID="$COMMITMENT_ID"
+    note "  commitment id from the Committed event: $COMMITMENT_ID (exported as DEMO_COMMITMENT_ID)"
   fi
 fi
 
-has 5 && forge_step "5 buyer releases early" DemoBuyerReleaseEarly DEMO_BUYER_KEY
+if has 5; then
+  # Resuming step 5 on its own: take the id from the environment, else from the journal row step 4
+  # wrote off the Committed event. Never derive or guess it. _commitment() then re-checks agent,
+  # policy, inputs, claim, reward and action against the chain before the release simulates.
+  if [[ -z "${DEMO_COMMITMENT_ID:-}" && -s "$JOURNAL" ]]; then
+    DEMO_COMMITMENT_ID=$(awk -F'\t' '$2=="commitment id"{v=$3} END{print v}' "$JOURNAL")
+    [[ -n "$DEMO_COMMITMENT_ID" ]] && note "  DEMO_COMMITMENT_ID loaded from the journal: $DEMO_COMMITMENT_ID"
+  fi
+  if [[ "${DEMO_COMMITMENT_ID:-}" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+    export DEMO_COMMITMENT_ID
+    forge_step "5 buyer releases early" DemoBuyerReleaseEarly DEMO_BUYER_KEY
+  elif [[ "$LIVE" == 1 ]]; then
+    die "step 5 needs DEMO_COMMITMENT_ID, from step 4 in this run, the journal, or the environment"
+  else
+    note ""; note "== 5 buyer releases early"; note "  dry run skipped: no commitment exists until step 4 broadcasts"
+  fi
+fi
 
 # ---------------------------------------------------------------- state
 
